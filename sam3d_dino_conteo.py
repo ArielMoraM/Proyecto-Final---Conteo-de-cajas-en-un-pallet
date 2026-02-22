@@ -13,6 +13,7 @@ python sam3d_dino_conteo.py \
 
 import argparse
 import glob
+import inspect
 import os
 import sys
 from dataclasses import dataclass
@@ -112,13 +113,23 @@ def dino_detect_boxes(
         outputs = dino_model(**inputs)
 
     target_sizes = torch.tensor([pil_img.size[::-1]]).to(device)
-    results = processor.post_process_grounded_object_detection(
-        outputs,
-        inputs.input_ids,
-        box_threshold=box_threshold,
-        text_threshold=text_threshold,
-        target_sizes=target_sizes,
-    )[0]
+
+    # Compatibilidad entre versiones de transformers
+    post_fn = processor.post_process_grounded_object_detection
+    sig = inspect.signature(post_fn)
+    kwargs = {}
+    if "input_ids" in sig.parameters:
+        kwargs["input_ids"] = inputs.input_ids
+    if "target_sizes" in sig.parameters:
+        kwargs["target_sizes"] = target_sizes
+    if "box_threshold" in sig.parameters:
+        kwargs["box_threshold"] = box_threshold
+    elif "threshold" in sig.parameters:
+        kwargs["threshold"] = box_threshold
+    if "text_threshold" in sig.parameters:
+        kwargs["text_threshold"] = text_threshold
+
+    results = post_fn(outputs, **kwargs)[0]
 
     boxes = results["boxes"].detach().cpu().numpy() if len(results["boxes"]) else np.empty((0, 4))
     scores = results["scores"].detach().cpu().numpy() if len(results["scores"]) else np.array([])

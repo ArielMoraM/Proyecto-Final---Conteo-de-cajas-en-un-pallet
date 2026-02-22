@@ -14,7 +14,6 @@ python sam3d_dino_conteo.py \
 import argparse
 import glob
 import os
-import sys
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -40,15 +39,18 @@ class Config:
     resize_w: int = 640
     resize_h: int = 360
     min_mask_region_area: int = 1000
-    max_mask_region_area: int = 2000
+    max_mask_region_area: int = 50000
     text_prompt: str = "cardboard box . carton box . pallet box ."
-    box_threshold: float = 0.30
-    text_threshold: float = 0.25
-    iou_threshold: float = 0.15
+    box_threshold: float = 0.20
+    text_threshold: float = 0.15
+    iou_threshold: float = 0.05
     dino_model_id: str = "IDEA-Research/grounding-dino-base"
+    max_mask_area_ratio: float = 0.40
+    frame_stride: int = 1
+    save_video: bool = False
 
 
-def extract_frames(video_path: str, frames_dir: str, max_frames: int, resize_w: int, resize_h: int) -> List[str]:
+def extract_frames(video_path: str, frames_dir: str, max_frames: int, resize_w: int, resize_h: int, frame_stride: int) -> List[str]:
     os.makedirs(frames_dir, exist_ok=True)
 
     cap = cv2.VideoCapture(video_path)
@@ -60,20 +62,25 @@ def extract_frames(video_path: str, frames_dir: str, max_frames: int, resize_w: 
 
     frame_paths = []
     count = 0
+    frame_idx = 0
+    saved = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        frame_small = cv2.resize(frame, (resize_w, resize_h))
-        save_path = os.path.join(frames_dir, f"frame_{count:03d}.jpg")
-        cv2.imwrite(save_path, frame_small)
-        frame_paths.append(save_path)
-        print(f"Guardado: {save_path}")
+        if frame_idx % max(1, frame_stride) == 0:
+            frame_small = cv2.resize(frame, (resize_w, resize_h))
+            save_path = os.path.join(frames_dir, f"frame_{saved:03d}.jpg")
+            cv2.imwrite(save_path, frame_small)
+            frame_paths.append(save_path)
+            print(f"Guardado: {save_path}")
+            saved += 1
+            if saved >= max_frames:
+                break
 
+        frame_idx += 1
         count += 1
-        if count >= max_frames:
-            break
 
     cap.release()
     print(f"Total frames extraídos: {len(frame_paths)}")
@@ -154,7 +161,10 @@ def sam_dino_boxes_for_frame(
     cfg: Config,
 ):
     sam_masks = mask_generator.generate(image_rgb)
-    sam_masks = [m for m in sam_masks if m["segmentation"].sum() <= cfg.max_mask_region_area]
+    sam_total = len(sam_masks)
+    frame_area = image_rgb.shape[0] * image_rgb.shape[1]
+    max_area_limit = min(cfg.max_mask_region_area, int(frame_area * cfg.max_mask_area_ratio))
+    sam_masks = [m for m in sam_masks if m["segmentation"].sum() <= max_area_limit]
 
     dino_boxes, dino_scores, dino_labels = dino_detect_boxes(
         image_rgb=image_rgb,
@@ -176,7 +186,8 @@ def sam_dino_boxes_for_frame(
         if any(bbox_iou(sam_box, db) >= cfg.iou_threshold for db in dino_boxes):
             semantic_masks.append(mask)
 
-    return semantic_masks, dino_boxes, dino_scores, dino_labels
+    debug = {"sam_total": sam_total, "sam_filtered": len(sam_masks), "dino_boxes": len(dino_boxes)}
+    return semantic_masks, dino_boxes, dino_scores, dino_labels, debug
 
 
 def save_visualization(
@@ -254,6 +265,7 @@ def main(cfg: Config):
         cfg.max_frames,
         cfg.resize_w,
         cfg.resize_h,
+        cfg.frame_stride,
     )
 
     sam = sam_model_registry[cfg.model_type](checkpoint=cfg.sam_checkpoint)
@@ -277,7 +289,7 @@ def main(cfg: Config):
         img_bgr = cv2.imread(fp)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        semantic_masks, dino_boxes, dino_scores, dino_labels = sam_dino_boxes_for_frame(
+        semantic_masks, dino_boxes, dino_scores, dino_labels, debug = sam_dino_boxes_for_frame(
             img_rgb,
             mask_generator,
             processor,
@@ -287,6 +299,7 @@ def main(cfg: Config):
         )
         conteos_por_frame.append(len(semantic_masks))
         resultados.append((fp, img_rgb, semantic_masks, dino_boxes, dino_scores, dino_labels))
+        print(f"{os.path.basename(fp)} | SAM_total={debug['sam_total']} | SAM_filtradas={debug['sam_filtered']} | DINO_boxes={debug['dino_boxes']} | Final={len(semantic_masks)}")
 
     print("\nConteo estimado de cajas por frame:")
     for (fp, *_), c in zip(resultados, conteos_por_frame):
@@ -296,9 +309,25 @@ def main(cfg: Config):
     print(f"Promedio de cajas detectadas: {promedio}")
 
     if resultados:
-        vis_path = os.path.join(cfg.output_dir, "visualizacion_sam_dino.png")
-        save_visualization(*resultados[0], output_path=vis_path)
-        print(f"Visualización guardada en: {vis_path}")
+        vis_dir = os.path.join(cfg.output_dir, "visualizaciones")
+        os.makedirs(vis_dir, exist_ok=True)
+        vis_paths = []
+        for i, r in enumerate(resultados):
+            vis_path = os.path.join(vis_dir, f"vis_{i:03d}.png")
+            save_visualization(*r, output_path=vis_path)
+            vis_paths.append(vis_path)
+        print(f"Visualizaciones guardadas en: {vis_dir}")
+
+        if cfg.save_video and vis_paths:
+            first = cv2.imread(vis_paths[0])
+            h, w = first.shape[:2]
+            video_out = os.path.join(cfg.output_dir, "visualizacion_sam_dino.mp4")
+            writer = cv2.VideoWriter(video_out, cv2.VideoWriter_fourcc(*"mp4v"), 10, (w, h))
+            for pth in vis_paths:
+                frame = cv2.imread(pth)
+                writer.write(frame)
+            writer.release()
+            print(f"Video de visualización guardado en: {video_out}")
 
 
 if __name__ == "__main__":
@@ -311,11 +340,14 @@ if __name__ == "__main__":
     parser.add_argument("--resize_w", type=int, default=640)
     parser.add_argument("--resize_h", type=int, default=360)
     parser.add_argument("--min_mask_region_area", type=int, default=1000)
-    parser.add_argument("--max_mask_region_area", type=int, default=2000)
+    parser.add_argument("--max_mask_region_area", type=int, default=50000)
+    parser.add_argument("--max_mask_area_ratio", type=float, default=0.40)
+    parser.add_argument("--frame_stride", type=int, default=1)
+    parser.add_argument("--save_video", action="store_true")
     parser.add_argument("--text_prompt", default="cardboard box . carton box . pallet box .")
-    parser.add_argument("--box_threshold", type=float, default=0.30)
-    parser.add_argument("--text_threshold", type=float, default=0.25)
-    parser.add_argument("--iou_threshold", type=float, default=0.15)
+    parser.add_argument("--box_threshold", type=float, default=0.20)
+    parser.add_argument("--text_threshold", type=float, default=0.15)
+    parser.add_argument("--iou_threshold", type=float, default=0.05)
     parser.add_argument("--dino_model_id", default="IDEA-Research/grounding-dino-base")
 
     args = parser.parse_args()
@@ -335,6 +367,9 @@ if __name__ == "__main__":
         text_threshold=args.text_threshold,
         iou_threshold=args.iou_threshold,
         dino_model_id=args.dino_model_id,
+        max_mask_area_ratio=args.max_mask_area_ratio,
+        frame_stride=args.frame_stride,
+        save_video=args.save_video,
     )
 
     main(cfg)
